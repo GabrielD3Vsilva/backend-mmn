@@ -1,15 +1,23 @@
 // server.js
 
+require('dotenv').config(); // Garante que as variáveis de ambiente do .env sejam carregadas
 const express = require('express');
 const mongoose = require('mongoose');
 const bodyParser = require('body-parser');
 const { v4: uuidv4 } = require('uuid'); // Para gerar IDs únicos de indicação
+const axios = require('axios'); // Importa o Axios para fazer requisições HTTP
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000; // Usa a porta do ambiente ou 3000
+
+// --- Configurações do Asaas ---
+// ATENÇÃO: Em produção, a chave de acesso deve vir de process.env.ASAAS_ACCESS_TOKEN
+// e NUNCA ser hardcoded.
+const ASAAS_ACCESS_TOKEN = process.env.ASAAS_ACCESS_TOKEN || '$aact_YTU5YTE0M2M2N2I4MTliNzk0YTI5N2U5MzdjNWZmNDQ6OjAwMDAwMDAwMDAwMDA1MzYzMjM6OiRhYWNoX2UxYjgwYjY4LTA4OWUtNGU3ZC1hNzZhLTQ2MGQ0OGY3NjIwZA==';
+const ASAAS_API_URL = 'https://www.asaas.com/api/v3'; // URL da API de produção do Asaas
 
 // Conexão com o MongoDB
-mongoose.connect('mongodb+srv://gabrield3vsilva:mYoTxNAvOIckyNDW@cluster0.syhanoa.mongodb.net/', {
+mongoose.connect(process.env.MONGODB_URI || 'mongodb+srv://gabrield3vsilva:mYoTxNAvOIckyNDW@cluster0.syhanoa.mongodb.net/', {
     useNewUrlParser: true,
     useUnifiedTopology: true,
 })
@@ -21,11 +29,13 @@ app.use(bodyParser.json());
 
 // --- Schemas do MongoDB ---
 
-// Schema do Usuário
+// Schema do Usuário (Adicionado cpfCnpj para Asaas)
 const userSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true },
     password: { type: String, required: true }, // SEM CRIPTOGRAFIA! Apenas para demonstração.
     email: { type: String, required: true, unique: true },
+    phone: { type: String }, // Adicionado campo de telefone para o cliente Asaas
+    cpfCnpj: { type: String }, // Adicionado campo de CPF/CNPJ para o cliente Asaas
     referralLink: { type: String, unique: true },
     sponsor: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     network: {
@@ -48,6 +58,7 @@ const userSchema = new mongoose.Schema({
     }],
     isActive: { type: Boolean, default: false }, // Ativo se pagou a adesão
     plan: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', default: null }, // Plano ativo
+    asaasCustomerId: { type: String }, // ID do cliente no Asaas
 });
 
 // Schema do Produto/Plano
@@ -86,6 +97,7 @@ const withdrawalRequestSchema = new mongoose.Schema({
     status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
     requestDate: { type: Date, default: Date.now },
     processDate: { type: Date },
+    rejectionReason: { type: String }, // Adicionado para motivo de rejeição
 });
 
 // Schema de Configurações da Empresa (White Label)
@@ -124,32 +136,93 @@ const SupportMaterial = mongoose.model('SupportMaterial', supportMaterialSchema)
 
 // --- Funções Auxiliares ---
 
+// Função para criar ou buscar um cliente no Asaas
+async function getOrCreateAsaasCustomer(user) {
+    // Se o usuário já tem um ID de cliente Asaas, retorna ele
+    if (user.asaasCustomerId) {
+        return user.asaasCustomerId;
+    }
+
+    try {
+        const customerData = {
+            name: user.username, // Usar username como nome do cliente no Asaas
+            email: user.email,
+            phone: user.phone, // Certifique-se que o campo 'phone' existe no seu User Schema
+            cpfCnpj: user.cpfCnpj, // Certifique-se que o campo 'cpfCnpj' existe no seu User Schema
+            // Adicione outros campos se necessário (ex: address)
+        };
+
+        const response = await axios.post(`${ASAAS_API_URL}/customers`, customerData, {
+            headers: {
+                'Content-Type': 'application/json',
+                'access_token': ASAAS_ACCESS_TOKEN,
+            }
+        });
+
+        // Salva o ID do cliente Asaas no seu banco de dados
+        user.asaasCustomerId = response.data.id;
+        await user.save();
+        return response.data.id;
+
+    } catch (error) {
+        console.error('Erro ao criar/buscar cliente no Asaas:', error.response ? error.response.data : error.message);
+        throw new Error('Falha ao processar cliente no Asaas.');
+    }
+}
+
+// Função para criar um pagamento no Asaas
+async function createAsaasPayment(customerAsaasId, value, description, billingType, creditCardToken = null) {
+    const paymentData = {
+        customer: customerAsaasId,
+        billingType: billingType, // Ex: 'CREDIT_CARD', 'BOLETO', 'PIX'
+        value: value,
+        dueDate: new Date().toISOString().split('T')[0], // Data de vencimento hoje
+        description: description,
+        // creditCardToken: creditCardToken // Necessário se billingType for CREDIT_CARD e você estiver usando tokenização
+    };
+
+    try {
+        const response = await axios.post(`${ASAAS_API_URL}/payments`, paymentData, {
+            headers: {
+                'Content-Type': 'application/json',
+                'access_token': ASAAS_ACCESS_TOKEN,
+            }
+        });
+        return response.data; // Retorna os dados do pagamento criado no Asaas
+    } catch (error) {
+        console.error('Erro ao criar pagamento no Asaas:', error.response ? error.response.data : error.message);
+        throw new Error('Falha ao criar pagamento no Asaas.');
+    }
+}
+
 // Função para calcular e distribuir comissões
 async function distributeCommissions(userId, commissionType, product) {
     let currentUser = await User.findById(userId);
-    if (!currentUser) return;
+    if (!currentUser || !currentUser.isActive) return; // Só distribui se o usuário estiver ativo
 
     let level = 1;
     let sponsor = await User.findById(currentUser.sponsor);
 
     while (sponsor && level <= 8) {
-        const commissionAmount = product.commissions[commissionType][`level${level}`];
-        if (commissionAmount > 0) {
-            sponsor.balance += commissionAmount;
-            sponsor.commissions.push({
-                amount: commissionAmount,
-                type: commissionType,
-                fromUser: currentUser._id,
-                level: level,
-            });
-            await sponsor.save();
+        // Verifica se o patrocinador está ativo para receber
+        if (sponsor.isActive) {
+            const commissionAmount = product.commissions[commissionType][`level${level}`];
+            if (commissionAmount > 0) {
+                sponsor.balance += commissionAmount;
+                sponsor.commissions.push({
+                    amount: commissionAmount,
+                    type: commissionType,
+                    fromUser: currentUser._id,
+                    level: level,
+                });
+                await sponsor.save();
+            }
         }
         level++;
         currentUser = sponsor;
         sponsor = await User.findById(currentUser.sponsor);
     }
 }
-
 // --- Rotas da API ---
 
 // 0. Rota para Login (Simples - SEM SEGURANÇA)
@@ -157,6 +230,8 @@ app.post('/login', async (req, res) => {
     const { username, password } = req.body;
     const user = await User.findOne({ username, password }); // SEM CRIPTOGRAFIA!
     if (user) {
+        // Adicione o campo 'role' se você tiver um no seu schema User
+        // Por exemplo: res.status(200).json({ message: 'Login bem-sucedido!', userId: user._id, username: user.username, role: user.role });
         res.status(200).json({ message: 'Login bem-sucedido!', userId: user._id, username: user.username });
     } else {
         res.status(401).json({ message: 'Credenciais inválidas.' });
@@ -166,13 +241,24 @@ app.post('/login', async (req, res) => {
 // Rota para criar um usuário ADMIN (manual ou uma rota inicial para o primeiro admin)
 // Apenas para demonstração. Em produção, isso seria um processo seguro de bootstrap.
 app.post('/admin/create', async (req, res) => {
-    const { username, password, email } = req.body;
+    const { username, password, email, phone, cpfCnpj } = req.body; // Adicionado phone e cpfCnpj
     try {
-        const existingAdmin = await User.findOne({ username, password }); // Simples, apenas para identificar se é um admin pre-existente
-        if (existingAdmin) {
-            return res.status(400).json({ message: 'Admin já existe.' });
+        // Em um sistema real, você não criaria admin por aqui ou teria um controle de acesso muito mais rigoroso.
+        // E a senha seria hash (bcrypt).
+        const existingUser = await User.findOne({ username }); // Verifica se o username já existe
+        if (existingUser) {
+            return res.status(400).json({ message: 'Nome de usuário já existe.' });
         }
-        const adminUser = new User({ username, password, email, referralLink: `admin-${uuidv4()}` });
+
+        const adminUser = new User({
+            username,
+            password, // Lembre-se: sem hash aqui!
+            email,
+            phone,
+            cpfCnpj,
+            referralLink: `admin-${uuidv4()}`,
+            // role: 'admin' // Se você adicionar um campo 'role' no seu UserSchema
+        });
         await adminUser.save();
         res.status(201).json({ message: 'Admin criado com sucesso!', adminId: adminUser._id });
     } catch (error) {
@@ -182,7 +268,7 @@ app.post('/admin/create', async (req, res) => {
 
 // 1. Cadastro e Indicação
 app.post('/register', async (req, res) => {
-    const { username, password, email, sponsorReferralLink } = req.body;
+    const { username, password, email, phone, cpfCnpj, sponsorReferralLink } = req.body; // Adicionado phone e cpfCnpj
 
     try {
         let sponsor = null;
@@ -197,6 +283,8 @@ app.post('/register', async (req, res) => {
             username,
             password,
             email,
+            phone, // Salva o telefone
+            cpfCnpj, // Salva o CPF/CNPJ
             referralLink: uuidv4(), // Gera um link de indicação único
             sponsor: sponsor ? sponsor._id : null,
         });
@@ -221,6 +309,7 @@ app.post('/register', async (req, res) => {
         res.status(201).json({
             message: 'Usuário cadastrado com sucesso!',
             userId: newUser._id,
+            username: newUser.username, // Retorna o username para facilitar o login no frontend
             referralLink: newUser.referralLink,
         });
 
@@ -279,7 +368,7 @@ app.get('/products', async (req, res) => {
 // Compra de Adesão (Ativa o plano e mensalidade)
 app.post('/users/:userId/buy-adhesion/:productId', async (req, res) => {
     const { userId, productId } = req.params;
-    const { paymentMethod } = req.body; // Ex: 'pix', 'pagseguro', 'mercadopago', 'assass'
+    const { paymentMethod, creditCardToken } = req.body; // creditCardToken para pagamentos com cartão
 
     try {
         const user = await User.findById(userId);
@@ -293,25 +382,30 @@ app.post('/users/:userId/buy-adhesion/:productId', async (req, res) => {
             return res.status(400).json({ message: 'Usuário já possui um plano ativo.' });
         }
 
-        // --- Integração com Gateway de Pagamento (Placeholder para 'Assass') ---
-        // Aqui você integraria com o gateway de pagamento real.
-        // Por exemplo, chamaria uma API do Pix, PagSeguro, Mercado Pago, etc.
-        let paymentSuccess = false;
-        if (paymentMethod === 'assass') {
-            // Simulando uma chamada à API do "Assass" gateway
-            console.log(`Simulando pagamento de adesão de R$ ${product.adhesionValue} para ${user.username} via Assass.`);
-            // Em um ambiente real, você faria uma requisição HTTP para a API do gateway
-            // e esperaria a confirmação de pagamento.
-            // Para esta demonstração, vamos considerar que sempre terá sucesso.
-            paymentSuccess = true;
-        } else {
-            // Outros gateways de pagamento (Pix, PagSeguro, Mercado Pago)
-            // Lógica para integração real com esses gateways
-            console.log(`Simulando pagamento de adesão de R$ ${product.adhesionValue} para ${user.username} via ${paymentMethod}.`);
-            paymentSuccess = true; // Simular sucesso para outros também.
+        // 1. Criar ou obter o cliente no Asaas
+        const customerAsaasId = await getOrCreateAsaasCustomer(user);
+
+        // 2. Criar o pagamento no Asaas
+        let asaasPaymentResponse;
+        try {
+            asaasPaymentResponse = await createAsaasPayment(
+                customerAsaasId,
+                product.adhesionValue,
+                `Pagamento de Adesão - Plano ${product.name}`,
+                paymentMethod, // 'PIX', 'BOLETO', 'CREDIT_CARD'
+                creditCardToken // Passa o token do cartão se for o caso
+            );
+            console.log('Resposta do Asaas (Adesão):', asaasPaymentResponse);
+        } catch (paymentError) {
+            console.error('Erro na criação do pagamento Asaas (Adesão):', paymentError.message);
+            return res.status(500).json({ message: 'Falha ao iniciar pagamento da adesão no Asaas.', error: paymentError.message });
         }
 
-        if (paymentSuccess) {
+        // 3. Verificar o status inicial do pagamento (para Pix/Boleto, o status inicial é PENDING)
+        // Em um sistema real, você usaria Webhooks do Asaas para confirmar o status final do pagamento.
+        // Para esta demonstração, vamos considerar que a criação bem-sucedida da cobrança é suficiente para prosseguir.
+        // Se o paymentMethod for 'CREDIT_CARD', o status pode ser 'CONFIRMED' ou 'RECEIVED' imediatamente.
+        if (asaasPaymentResponse.status === 'PENDING' || asaasPaymentResponse.status === 'CONFIRMED' || asaasPaymentResponse.status === 'RECEIVED') {
             user.isActive = true;
             user.plan = product._id;
             await user.save();
@@ -319,20 +413,26 @@ app.post('/users/:userId/buy-adhesion/:productId', async (req, res) => {
             // Distribuir comissões de adesão
             await distributeCommissions(user._id, 'adhesion', product);
 
-            res.status(200).json({ message: 'Adesão comprada e plano ativado com sucesso!', user });
+            res.status(200).json({
+                message: 'Adesão comprada e plano ativado com sucesso! Pagamento em processamento.',
+                user,
+                asaasPayment: asaasPaymentResponse // Retorna a resposta do Asaas para o frontend
+            });
         } else {
-            res.status(500).json({ message: 'Falha no pagamento da adesão.' });
+            // Se o status inicial não for um dos esperados, algo deu errado no Asaas
+            res.status(500).json({ message: 'Pagamento da adesão não foi processado com sucesso pelo Asaas.', asaasPayment: asaasPaymentResponse });
         }
 
     } catch (error) {
+        console.error('Erro geral ao comprar adesão:', error.message);
         res.status(500).json({ message: 'Erro ao comprar adesão.', error: error.message });
     }
 });
 
-// Pagamento de Mensalidade (Simulação)
+// Pagamento de Mensalidade
 app.post('/users/:userId/pay-monthly/:productId', async (req, res) => {
     const { userId, productId } = req.params;
-    const { paymentMethod } = req.body;
+    const { paymentMethod, creditCardToken } = req.body; // creditCardToken para pagamentos com cartão
 
     try {
         const user = await User.findById(userId);
@@ -346,17 +446,27 @@ app.post('/users/:userId/pay-monthly/:productId', async (req, res) => {
             return res.status(400).json({ message: 'Usuário não tem este plano ativo para pagar a mensalidade.' });
         }
 
-        // --- Integração com Gateway de Pagamento (Placeholder para 'Assass') ---
-        let paymentSuccess = false;
-        if (paymentMethod === 'assass') {
-            console.log(`Simulando pagamento de mensalidade de R$ ${product.monthlyValue} para ${user.username} via Assass.`);
-            paymentSuccess = true;
-        } else {
-            console.log(`Simulando pagamento de mensalidade de R$ ${product.monthlyValue} para ${user.username} via ${paymentMethod}.`);
-            paymentSuccess = true;
+        // 1. Criar ou obter o cliente no Asaas
+        const customerAsaasId = await getOrCreateAsaasCustomer(user);
+
+        // 2. Criar o pagamento no Asaas
+        let asaasPaymentResponse;
+        try {
+            asaasPaymentResponse = await createAsaasPayment(
+                customerAsaasId,
+                product.monthlyValue,
+                `Pagamento de Mensalidade - Plano ${product.name}`,
+                paymentMethod, // 'PIX', 'BOLETO', 'CREDIT_CARD'
+                creditCardToken // Passa o token do cartão se for o caso
+            );
+            console.log('Resposta do Asaas (Mensalidade):', asaasPaymentResponse);
+        } catch (paymentError) {
+            console.error('Erro na criação do pagamento Asaas (Mensalidade):', paymentError.message);
+            return res.status(500).json({ message: 'Falha ao iniciar pagamento da mensalidade no Asaas.', error: paymentError.message });
         }
 
-        if (paymentSuccess) {
+        // 3. Verificar o status inicial do pagamento
+        if (asaasPaymentResponse.status === 'PENDING' || asaasPaymentResponse.status === 'CONFIRMED' || asaasPaymentResponse.status === 'RECEIVED') {
             // Aqui você registraria o pagamento da mensalidade (ex: em um histórico de pagamentos)
             // E possivelmente atualizar a data da próxima mensalidade.
             // Para simplicidade, apenas distribuiremos as comissões.
@@ -364,12 +474,17 @@ app.post('/users/:userId/pay-monthly/:productId', async (req, res) => {
             // Distribuir comissões de mensalidade
             await distributeCommissions(user._id, 'monthly', product);
 
-            res.status(200).json({ message: 'Mensalidade paga com sucesso!', user });
+            res.status(200).json({
+                message: 'Mensalidade paga com sucesso! Pagamento em processamento.',
+                user,
+                asaasPayment: asaasPaymentResponse // Retorna a resposta do Asaas para o frontend
+            });
         } else {
-            res.status(500).json({ message: 'Falha no pagamento da mensalidade.' });
+            res.status(500).json({ message: 'Pagamento da mensalidade não foi processado com sucesso pelo Asaas.', asaasPayment: asaasPaymentResponse });
         }
 
     } catch (error) {
+        console.error('Erro geral ao pagar mensalidade:', error.message);
         res.status(500).json({ message: 'Erro ao pagar mensalidade.', error: error.message });
     }
 });
@@ -505,6 +620,23 @@ app.get('/support-materials/categories', async (req, res) => {
         res.status(200).json(categories);
     } catch (error) {
         res.status(500).json({ message: 'Erro ao buscar categorias de materiais.', error: error.message });
+    }
+});
+
+// No seu server.js, adicione esta rota:
+app.get('/users/:userId/network', async (req, res) => {
+    const { userId } = req.params;
+    try {
+        const user = await User.findById(userId).populate({
+            path: 'network.level1 network.level2 network.level3 network.level4 network.level5 network.level6 network.level7 network.level8',
+            select: 'username email isActive'
+        });
+        if (!user) {
+            return res.status(404).json({ message: 'Usuário não encontrado.' });
+        }
+        res.status(200).json({ network: user.network });
+    } catch (error) {
+        res.status(500).json({ message: 'Erro ao buscar rede do usuário.', error: error.message });
     }
 });
 
